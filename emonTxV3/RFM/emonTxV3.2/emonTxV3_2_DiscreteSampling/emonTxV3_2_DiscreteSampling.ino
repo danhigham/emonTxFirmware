@@ -1,3 +1,4 @@
+
 /*
   
   emonTxV3 Discrete Sampling
@@ -39,7 +40,7 @@ V1.1 - fix bug in startup Vrms calculation, startup Vrms startup calculation is 
 */
 
 #define emonTxV3                                                      // Tell emonLib this is the emonTx V3 - don't read Vcc assume Vcc = 3.3V as is always the case on emonTx V3 eliminates bandgap error and need for calibration http://harizanov.com/2013/09/thoughts-on-avr-adc-accuracy/
-
+#include <SoftwareSerial.h>
 #include <RFu_JeeLib.h>                                               // Special modified version of the JeeJib library to work with the RFu328 https://github.com/openenergymonitor/RFu_jeelib        
 ISR(WDT_vect) { Sleepy::watchdogEvent(); }                            // Attached JeeLib sleep function to Atmega328 watchdog -enables MCU to be put into sleep mode inbetween readings to reduce power consumption 
 
@@ -51,24 +52,25 @@ EnergyMonitor ct1, ct2, ct3, ct4;
 
 const byte version = 20;                   // firmware version divided by 10 e,g 16 = V1.6
 
+char lcdLine1[16];
+char lcdLine2[16];
 
 //----------------------------emonTx V3 Settings---------------------------------------------------------------------------------------------------------------
-const byte Vrms=                  230;                                  // Vrms for apparent power readings (when no AC-AC voltage sample is present)
+const byte Vrms=                  120;                                  // Vrms for apparent power readings (when no AC-AC voltage sample is present)
 const byte TIME_BETWEEN_READINGS= 10;                                   //Time between readings   
 
-const float Ical1=                90.9;                                 // (2000 turns / 22 Ohm burden) = 90.9
-const float Ical2=                90.9;                                 // (2000 turns / 22 Ohm burden) = 90.9
+const float Ical1=                181.8;                                // (2000 turns / 22 Ohm burden) = 90.9
+const float Ical2=                181.8;                                // (2000 turns / 22 Ohm burden) = 90.9
 const float Ical3=                90.9;                                 // (2000 turns / 22 Ohm burden) = 90.9
 const float Ical4=                16.6;                                 // (2000 turns / 120 Ohm burden) = 16.6
 
-const float Vcal=                 276.9;                                // (230V x 13) / (9V x 1.2) = 276.9
+const float Vcal=                 130.9;                                // (230V x 13) / (9V x 1.2) = 276.9
 
 const float phase_shift=          1.7;
 const int no_of_samples=          1480; 
 const int no_of_half_wavelengths= 20;
 const int timeout=                2000;                               //emonLib timeout 
 const int ACAC_DETECTION_LEVEL=   3000;
-const byte min_pulsewidth= 110;                                // minimum width of interrupt pulse (default pulse output meters = 100ms)
 const int TEMPERATURE_PRECISION=  11;                 //9 (93.8ms),10 (187.5ms) ,11 (375ms) or 12 (750ms) bits equal to resplution of 0.5C, 0.25C, 0.125C and 0.0625C
 const byte MaxOnewire=             6;                            // +1 since arrya starts at 0. maximum number of DS18B20 one wire sensors
 //#define FILTERSETTLETIME          25000                     // Time (ms) to allow the filters to settle before sending data
@@ -78,10 +80,9 @@ const byte MaxOnewire=             6;                            // +1 since arr
 
 
 //----------------------------emonTx V3 hard-wired connections--------------------------------------------------------------------------------------------------------------- 
+const byte LCDpin=                2;
 const byte LEDpin=                6;                              // emonTx V3 LED
 const byte DS18B20_PWR=           19;                              // DS18B20 Power
-const byte pulse_countINT=         0;                              // Terminal Block Pulse counting pin(emonTx V3.4) - (INT0 / Dig2 emonTx V3.2)
-const byte pulse_count_pin=        2;                              // Terminal Block Pulse counting pin(emonTx V3.4) - (INT0 / Dig2 emonTx V3.2)
 #define ONE_WIRE_BUS              5                              // DS18B20 Data                     
 //-------------------------------------------------------------------------------------------------------------------------------------------
 
@@ -99,7 +100,6 @@ const byte nodeID = 10;                                                // emonTx
 const int networkGroup = 210;
 typedef struct { 
 int power1, power2, power3, power4, Vrms, temp[MaxOnewire]; 
-int pulseCount; 
 } PayloadTX;     // create structure - a neat way of packaging data for RF comms
   PayloadTX emontx; 
 //-------------------------------------------------------------------------------------------------------------------------------------------
@@ -110,24 +110,28 @@ int pulseCount;
 //boolean settled = false;
 boolean CT1, CT2, CT3, CT4, ACAC, debug, DS18B20_STATUS; 
 byte CT_count=0;
-volatile byte pulseCount = 0;
-unsigned long pulsetime=0;                                      // Record time of interrupt pulse        
+
+char pwr1[16], pwr2[16], pwr3[16], pwr4[16];
+SoftwareSerial LCD(10, LCDpin);
 
 void setup()
 { 
- 
+  pinMode(LCDpin, OUTPUT);
+  
+  LCD.begin(9600); // set up serial port for 9600 baud
+  delay(500); // wait for display to boot up
+
   pinMode(LEDpin, OUTPUT); 
   pinMode(DS18B20_PWR, OUTPUT);  
   digitalWrite(LEDpin,HIGH); 
   
-  pinMode(pulse_count_pin, INPUT);                             // Set emonTx V3.4 interrupt pulse counting pin as input (Dig 3 / INT1)
-  emontx.pulseCount=0;                                        // Make sure pulse count starts at zero
-
-  Serial.begin(9600);
+  Serial.begin(115200);
   Serial.println(" ");
   Serial.print("emonTx V3.2 Discrete Sampling V"); Serial.println(version*0.1);
   Serial.println("OpenEnergyMonitor.org");
   Serial.println("POST.....wait 10s");
+
+  writeLCD("emonTx V3.2", "Wait 10s");
   
   delay(10);
   rf12_initialize(nodeID, RF_freq, networkGroup);                          // initialize RFM12B
@@ -262,7 +266,6 @@ void setup()
     if (CT4) ct4.voltage(0, Vcal, phase_shift);          // ADC pin, Calibration, phase_shift
   }
  
- attachInterrupt(pulse_countINT, onPulse, FALLING);     // Attach pulse counting interrupt pulse counting  
 } //end setup
 
 void loop()
@@ -325,12 +328,45 @@ void loop()
   }
   
     if (debug==1) {
+    itoa(emontx.power1, pwr1, 10);
+    itoa(emontx.power2, pwr2, 10);
+    itoa(emontx.power3, pwr3, 10);
+    itoa(emontx.power4, pwr4, 10);
+    
     Serial.print(emontx.power1); Serial.print(" ");
     Serial.print(emontx.power2); Serial.print(" ");
     Serial.print(emontx.power3); Serial.print(" ");
     Serial.print(emontx.power4); Serial.print(" ");
     Serial.print(emontx.Vrms); Serial.print(" ");
-    Serial.print(emontx.pulseCount); Serial.print(" ");
+    Serial.print(0); Serial.print(" ");
+
+    sprintf(lcdLine1, "C1:%04d C2:%04d", emontx.power1, emontx.power2);
+    sprintf(lcdLine2, "C3:%04d C4:%04d", emontx.power3, emontx.power4);
+
+//    writeLCD(lcdLine1, lcdLine2);
+
+     // move cursor to beginning of first line
+  LCD.write(254);
+  LCD.write(128);
+
+  // clear display by sending spaces
+  LCD.write("                ");
+  LCD.write("                ");
+
+  // move cursor to beginning of first line
+  LCD.write(254);
+  LCD.write(128);
+
+  LCD.write(lcdLine1);
+
+  // move cursor to beginning of second line
+  LCD.write(254);
+  LCD.write(192);
+
+  LCD.write(lcdLine2);
+
+  LCD.flush();
+  
     if (DS18B20_STATUS==1){
       for(byte j=0;j<numSensors;j++){
         Serial.print(emontx.temp[j]);
@@ -342,7 +378,7 @@ void loop()
   } 
 
  
-
+  Serial.flush();
   
     if (DS18B20_STATUS==1)
   {
@@ -354,13 +390,6 @@ void loop()
       digitalWrite(DS18B20_PWR, LOW);
   }
   
-   if (pulseCount)                                                       // if the ISR has counted some pulses, update the total count
-  {
-    cli();                                                             // Disable interrupt just in case pulse comes in while we are updating the count
-    emontx.pulseCount += pulseCount;
-    pulseCount = 0;
-    sei();                                                            // Re-enable interrupts
-  }
   
   
  
@@ -379,6 +408,30 @@ void loop()
       emontx_sleep(TIME_BETWEEN_READINGS);                                  // sleep or delay in seconds 
     
 } //end loop
+
+void writeLCD(char line1[], char line2[])
+{
+ // move cursor to beginning of first line
+  LCD.write(254);
+  LCD.write(128);
+
+  // clear display by sending spaces
+  LCD.write("                ");
+  LCD.write("                ");
+
+  // move cursor to beginning of first line
+  LCD.write(254);
+  LCD.write(128);
+
+  LCD.write(line1);
+
+  // move cursor to beginning of second line
+  LCD.write(254);
+  LCD.write(192);
+
+  LCD.write(line2);
+  LCD.flush();
+}
 
 void send_rf_data()
 {
@@ -404,14 +457,6 @@ double calc_rms(int pin, int samples)
   return rms;
 }
 
-// The interrupt routine - runs each time a falling edge of a pulse is detected
-void onPulse()                  
-{  
-  if ( (millis() - pulsetime) > min_pulsewidth) {
-    pulseCount++;					//calculate wh elapsed from time between pulses
-    pulsetime=millis(); 
-  }	
-}
 
 int get_temperature(byte sensor)                
 {
